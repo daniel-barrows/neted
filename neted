@@ -1,0 +1,183 @@
+#!/bin/bash
+# License::   GPLv3+
+# Copyright:: 2017 Daniel Barrows
+# Status::    beta
+#
+# This currently doesn't do any sanity checks on arguments.
+#
+# The most powerful function here is neted merge, which basically lets you
+# compare and merge your local networks with some cached networks using meld,
+# and then saves the changes, while handling all the necessary file and network
+# permissions for you. Any existing network permissions may be lost.
+#
+# Currently these functions only accept directories of network descriptors. In
+# the future they may accept network descriptor files directly.
+#
+# This code may be useful in other situations where permissions are an issue
+# apart from just networks. Actually, generalizing it would probably improve the
+# usability of this script as well.
+#
+# For outside code, I recommend calling neted rather than invoking functions
+# directly. I do not intend to keep the functions as a stable API.
+
+
+### CONSTANTS
+[ -z $COLUMNS ] && COLUMNS="$(tput cols 2>/dev/null || echo 80)"
+EXIT_HELP_MESSAGE=0
+EXIT_USAGE_ERROR=7
+
+
+### FUNCTIONS
+
+show_usage(){
+  cat <<EOS
+  neted change-user-permissions USER [ DIR | FILE ]*
+  neted copy SOURCE [ DEST ]
+  neted copy-missing SOURCE DEST
+  neted merge SOURCE DEST
+  neted replace SOURCE [ DEST ]
+  neted shell
+EOS
+}
+
+neted_argerr(){
+  [[ $# < 2 ]] || neted_argerr "neted_argerr requires 0 or 1 arguments."
+  local message="$1"; [ -z "$message" ] && "Wrong number of arguments given."
+  echo "ERROR: $message" >&2
+  exit $EXIT_USAGE_ERROR
+}
+
+# usr here can be blank, a username, a full permissions argument, or empty.
+# Anything that doesn't contain a semicolon is presumed to be a username.
+neted_change_user_permissions(){
+  local usr="$1"
+  shift
+  [ ! -z "$usr" ] && [ ! -z "${usr##*;*}" ] && usr="user:$usr:;"
+  for filepath in "$@"; do
+    if [ -d "$filepath" ]; then
+      neted_change_user_permissions "$usr" "$filepath"/*
+    else
+      sed -Ei "s/^permissions=.*$/permissions=$usr/" "$filepath"
+    fi
+  done
+}
+
+neted_copy(){
+  [[ $# < 3 ]] || neted_argerr "neted_copy requires 1 or 2 arguments."
+  local source="$1"
+  [ -z "$source" ] && neted_argerr 'No source given to neted_copy'
+  local dest="$2"; [ -z "$dest" ] && dest=./
+
+  [[ "${dest: -1}" == "/" ]] && dest="$dest/$( basename -- "$source" )"
+  sudo cp -aiT "$source" "$dest"
+  sudo chown -R "$USER:$USER" "$dest"
+  chmod 666 "$dest"/*
+}
+
+# This really only makes sense if dest is system
+neted_copy_missing(){
+  [[ $# < 3 ]] || neted_argerr "neted_copy_missing requires 1 or 2 arguments."
+  local source="$1"
+  [ -z "$source" ] && neted_argerr 'No source given to neted_copy_missing'
+  local dest="$2"; [ -z "$dest" ] && dest=/etc/NetworkManager/system-connections
+
+  sudo cp -an "$source"/* "$dest/" \
+  && sudo chown root:root "$dest"/* \
+  && sudo chmod 600 "$dest"/* \
+  && sudo nmcli connection reload
+
+}
+
+# This really only makes sense if dest is system
+neted_replace(){
+  [[ $# < 3 ]] || neted_argerr "neted_copy_missing requires 1 or 2 arguments."
+  local source="$1"
+  [ -z "$source" ] && neted_argerr 'No source given to neted_copy_missing'
+  local dest="$2"; [ -z "$dest" ] && dest=/etc/NetworkManager/system-connections
+
+  sudo rm "$dest"/* \
+  && sudo cp -a "$source"/* "$dest/" \
+  && sudo chown root:root "$dest"/* \
+  && sudo chmod 600 "$dest"/* \
+  && sudo nmcli connection reload
+
+}
+
+# Right now only the first argument is handled for permissions issues at both
+# the file and the network levels.
+# Usage eg.: neted_merge system $DIRECTORY_PATH
+neted_merge(){
+  [[ $# == 2 ]] || neted_argerr "neted_merge requires 2 arguments."
+  local source="$1"
+  local dest="$2"
+  neted copy "$source" /tmp/system-connections \
+  && neted change-user-permissions '' /tmp/system-connections \
+  && meld /tmp/system-connections "$dest" \
+  && neted change-user-permissions "$USER" /tmp/system-connections \
+  && neted replace /tmp/system-connections "$source" \
+  && rm -R /tmp/system-connections
+}
+
+# Autocomplete would be great here.
+neted_shell(){
+  [[ $# == 0 ]] || echo "WARNING: neted_shell arguments ignored: $*" >&2
+  echo "Welcome to neted shell." \
+       "Type 'help' for available commands, or 'quit' to exit."
+  while read -p '> ' line; do
+    case $line in
+    q | quit | 'exit' ) break;;
+    s | shell         ) echo "ERROR: Subshells not permitted." >&2;;
+    h | -h | -? | help | --help | \
+    cat                         | \
+    u | change-user-permissions | \
+    c | copy                    | \
+    cm | copy-missing           | \
+    m | merge                   | \
+    r | replace                 ) neted $line;;
+    *                           ) $line;;
+    esac
+  done
+}
+
+neted_cat(){
+  [[ $# == 1 ]] || neted_argerr "neted_cat requires exactly 1 argument."
+  sudo cat /etc/NetworkManager/system-connections/"$1"
+}
+
+### COMMAND LINE OPTIONS
+neted(){
+  command="$1"
+  shift
+  args=()
+
+  for i in "$@"; do
+    case "$i" in
+    #-q  | --quiet         ) unset VERBOSE;;
+    #-v  | --verbose       ) VERBOSE=true;;
+    -h  | --help | '-?'   ) show_usage; return $EXIT_HELP_MESSAGE;;
+    -*                    ) echo ERROR: unknown option: "'$i'" >&2
+                            show_usage
+                            return $EXIT_USAGE_ERROR;;
+    system                ) args+=( "/etc/NetworkManager/system-connections" );;
+    *                     ) args+=( "$i" );;
+    esac
+  done
+
+  case $command in
+  h | -h | -? | help | --help ) show_usage; return $EXIT_HELP_MESSAGE;;
+  cat                         ) neted_cat                     "${args[@]}";;
+  u | change-user-permissions ) neted_change_user_permissions "${args[@]}";;
+  c | copy                    ) neted_copy                    "${args[@]}";;
+  cm | copy-missing           ) neted_copy_missing            "${args[@]}";;
+  m | merge                   ) neted_merge                   "${args[@]}";;
+  r | replace                 ) neted_replace                 "${args[@]}";;
+  s | shell                   ) neted_shell                   "${args[@]}";;
+  *                           ) echo ERROR: unknown command: "'$command'" >&2
+                                show_usage
+                                return $EXIT_USAGE_ERROR;;
+  esac
+}
+
+if [ "$(basename -- "$0")" = "neted" ]; then
+  neted "$@"
+fi
